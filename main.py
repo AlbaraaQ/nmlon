@@ -1,91 +1,100 @@
 import logging
-import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-from huggingface_hub import login
-import videogen_hub
-import torch
-import torchvision.io as io
-from dotenv import load_dotenv
-
-# تحميل متغيرات البيئة من ملف .env
-load_dotenv()
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import requests
+from together import Together  # تأكد من تثبيت مكتبة together
+import base64
+from io import BytesIO
+from PIL import Image
 
 # إعداد تسجيل الأخطاء والمعلومات
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# تسجيل الدخول باستخدام Token الخاص بك (من متغيرات البيئة)
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    logging.error("HF_TOKEN is not set. Please set the token in your environment.")
-    raise EnvironmentError("HF_TOKEN is not set. Check your .env file.")
+# إعداد مفتاح API لـ Together
+client = Together(api_key="5ba5c96173d4c62eab6e81edc5abc3f32c4a8c2aa732ef6edbdb2135d27ffdeb")
 
-login(token=HF_TOKEN)
+# إعداد مفتاح API لـ Hugging Face
+HUGGING_FACE_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-3.5-large-turbo"
+HUGGING_FACE_HEADERS = {"Authorization": "Bearer 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"}
 
-# تحميل النموذج
-try:
-    model = videogen_hub.load('VideoCrafter2')
-    logging.info("Model loaded successfully!")
-except Exception as e:
-    logging.error(f"Error loading the model: {e}")
-    raise
+# متغير لتحديد النموذج الذي اختاره المستخدم
+user_selected_model = {}
 
-# وظيفة لتوليد الفيديو بناءً على النص المدخل
-def generate_video(prompt: str) -> str:
-    try:
-        video = model.infer_one_video(prompt=prompt)
-        output_filename = "generated_video.mp4"
-        io.write_video(output_filename, video.permute(0, 2, 3, 1).numpy(), fps=30)
-        logging.info(f"Video generated and saved as {output_filename}")
-        return output_filename
-    except Exception as e:
-        logging.error(f"Error in generating video: {e}")
-        raise
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("Together (FLUX)", callback_data="flux"),
+            InlineKeyboardButton("Hugging Face (Stable Diffusion)", callback_data="stable_diffusion")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("اختر النموذج الذي ترغب باستخدامه:", reply_markup=reply_markup)
 
-# وظيفة لإرسال رسالة ترحيب عند استخدام أمر /start
-async def start(update: Update, context: CallbackContext):
-    logging.info("Received /start command")
-    await update.message.reply_text(
-        "مرحبًا بك في بوت توليد الفيديوهات! أرسل لي وصفًا نصيًا وسأقوم بإنشاء فيديو لك 🎥."
-    )
+async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    selected_model = query.data
+    user_selected_model[user_id] = selected_model
+    await query.answer()
+    await query.edit_message_text(text=f"تم اختيار النموذج: {selected_model}")
 
-# وظيفة التعامل مع الرسائل من تيليجرام
-async def handle_message(update: Update, context: CallbackContext):
+async def generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     user_prompt = update.message.text
-    logging.info(f"Received message: {user_prompt}")
-    await update.message.reply_text("جاري إنشاء الفيديو، يرجى الانتظار...")
-    try:
-        # توليد الفيديو بناءً على النص الذي أدخله المستخدم
-        video_path = generate_video(user_prompt)
 
-        # إرسال الفيديو إلى المستخدم
-        with open(video_path, 'rb') as video_file:
-            await update.message.reply_video(video=video_file)
-            logging.info(f"Video sent to user: {update.message.chat.username}")
-    except Exception as e:
-        logging.error(f"Error sending video: {e}")
-        await update.message.reply_text(f"حدث خطأ أثناء توليد الفيديو: {e}")
+    # تحقق من النموذج الذي اختاره المستخدم
+    model = user_selected_model.get(user_id, "flux")
 
-# إعداد البوت
+    if model == "flux":
+        await update.message.reply_text("جاري إنشاء الصورة باستخدام نموذج Together (FLUX)... قد يستغرق ذلك بعض الوقت.")
+        try:
+            response = client.images.generate(
+                prompt=user_prompt,
+                model="black-forest-labs/FLUX.1-schnell-Free",
+                width=1024,
+                height=768,
+                steps=1,
+                n=1,
+                response_format="b64_json"
+            )
+            if response.data:
+                image_base64 = response.data[0].b64_json
+                image_data = base64.b64decode(image_base64)
+                image = Image.open(BytesIO(image_data))
+                with BytesIO() as output:
+                    image.save(output, format="PNG")
+                    output.seek(0)
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=output)
+            else:
+                await update.message.reply_text("عذرًا، لم أتمكن من توليد صورة باستخدام نموذج Together.")
+        except Exception as e:
+            await update.message.reply_text(f"حدث خطأ أثناء توليد الصورة باستخدام Together: {e}")
+
+    elif model == "stable_diffusion":
+        await update.message.reply_text("جاري إنشاء الصورة باستخدام نموذج Hugging Face... قد يستغرق ذلك بعض الوقت.")
+        try:
+            response = requests.post(HUGGING_FACE_API_URL, headers=HUGGING_FACE_HEADERS, json={"inputs": user_prompt})
+            if response.status_code == 200:
+                image_bytes = response.content
+                image = Image.open(BytesIO(image_bytes))
+                with BytesIO() as output:
+                    image.save(output, format="PNG")
+                    output.seek(0)
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=output)
+            else:
+                await update.message.reply_text("عذرًا، لم أتمكن من توليد صورة باستخدام نموذج Hugging Face.")
+        except Exception as e:
+            await update.message.reply_text(f"حدث خطأ أثناء توليد الصورة باستخدام Hugging Face: {e}")
+
 def main():
-    # استخدام متغير بيئة للحصول على توكن البوت
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    if not TELEGRAM_TOKEN:
-        logging.error("TELEGRAM_TOKEN is not set. Please set the token in your environment.")
-        return
+    # استبدل 'YOUR_TELEGRAM_BOT_TOKEN' بالتوكن الخاص بالبوت
+    app = ApplicationBuilder().token('7865424971:AAF_Oe6lu8ZYAl5XIF1M6qU_8MK6GHWEll8').build()
 
-    # إعداد التطبيق
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(set_model))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_image))
 
-    # إعداد الـ Handlers للأوامر والرسائل
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
-    try:
-        logging.info("Bot is starting...")
-        application.run_polling()
-    except Exception as e:
-        logging.error(f"Error occurred during bot polling: {e}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
